@@ -1,0 +1,42 @@
+# === Custom Exclusions (Your Request) ===
+/outputs/
+/fed-learning/
+/images/
+/results/
+/experiments/train/outputs/
+test.py
+plotting.ipynb
+
+# === Python-Specific ===
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+.Python
+venv/              # Standard venv folder (alternative to fed-learning/)
+env/
+*.egg-info/
+dist/
+build/
+
+# === Jupyter/Notebooks ===
+.ipynb_checkpoints/
+
+# === Data/Model Files ===
+*.pickle
+*.h5
+*.pt
+*.pth
+*.csv
+*.parquet
+
+# === IDE/Editor ===
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# === Logs/Debug ===
+*.log
+*.tmp
