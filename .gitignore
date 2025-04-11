@@ -3,7 +3,6 @@
 /fed-learning/
 /images/
 /results/
-/experiments/train/outputs/
 test.py
 plotting.ipynb
 
@@ -14,8 +13,7 @@ __pycache__/
 *.pyd
 *.so
 .Python
-venv/              # Standard venv folder (alternative to fed-learning/)
-env/
+fed-learning/
 *.egg-info/
 dist/
 build/
