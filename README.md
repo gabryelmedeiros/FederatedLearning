@@ -62,7 +62,7 @@ Navigate to the repository root and run the following commands to execute the di
     ```
 
 ## Directory Structure
-
+```
 FederatedLearning/
 ├── experiments/
 │   ├── comparing_mini_batch_size.py    # Script to compare mini-batch sizes
@@ -80,7 +80,7 @@ FederatedLearning/
 ├── .gitignore                            # Specifies intentionally untracked files that Git should ignore
 ├── plotting.ipynb                        # Jupyter Notebook for result analysis and plotting
 └── requirements.txt                      # List of Python dependencies
-
+```
 
 ## Usage
 
@@ -102,9 +102,9 @@ This project is licensed under the terms of the [MIT License](LICENSE).
 
 ## Authors/Maintainers
 
-Gabryel Medeiros de Oliveira
-Lisandro Lovisolo
-Guilherme Lucio Abelha Mota
+* Gabryel Medeiros de Oliveira
+* Lisandro Lovisolo
+* Guilherme Lucio Abelha Mota
 
 ---
 *Last updated: April 10, 2025*
