@@ -2,7 +2,7 @@ import tensorflow as tf
 import numpy as np
 import os
 import pandas as pd
-from centralized_learning import cnn
+from train.centralized_learning import cnn
 
 
 # Central Server Class
@@ -421,7 +421,7 @@ def get_and_divide_dataset(num_clients, batch_size, max_dataset_size, normalizat
 
 # Example Usage
 if __name__ == "__main__":
-    output_dir = "./outputs"
+    output_dir = "./results"
     os.makedirs(output_dir, exist_ok=True)  # Create the output directory if it doesn't exist
 
     gradients_path = os.path.join(output_dir, "federated_emulation_average")
