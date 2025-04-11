@@ -1,11 +1,8 @@
 ## importing libraries
-from train import centralized_learning as cl
-from train import simple_federated_emulation as fl
-from train import simple_federated_emulation_per_batch as flb
+from train import centralized_learning as cl, simple_federated_emulation_per_batch as flb, \
+  simple_federated_emulation_per_average as fl
 import pandas as pd
 import tensorflow as tf
-import matplotlib.pyplot as plt
-import seaborn as sns
 
 
 ## creating funcions to run each type of training
@@ -92,9 +89,9 @@ def federated_batch_training(path: str, size: int, num_clients:int, rounds:int, 
   metrics_df = experimental_unit.federated_training(
     central_unit=central_unit,
     clients=clients,
-    epochs=rounds,
+    rounds=rounds,
     batch_size=batch_size,
-    path=path,
+    gradients_path=path,
   )
 
   return metrics_df
@@ -120,7 +117,7 @@ df_batch_wise = federated_batch_training("../outputs/federated_emulation_per_bat
 df_average = federated_average_training("../outputs/federated_emulation_average", NUM_IMAGES, NUM_CLIENTS, NUM_EPOCHS, BATCH_SIZE)
 df_centralized = centralized_training(NUM_IMAGES, BUFFER_SIZE, BATCH_SIZE, EPOCHS)
 
-path = "../results/"
+path = "./results/"
 df_batch_wise.to_csv(path + "batch_wise.csv")
 df_average.to_csv(path + "average.csv")
 df_centralized.to_csv(path + "centralized.csv")

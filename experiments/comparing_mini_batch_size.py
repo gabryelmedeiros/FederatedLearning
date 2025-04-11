@@ -1,25 +1,22 @@
-from train import simple_federated_emulation_per_batch as flb
-from train import centralized_learning as cl
+from train import simple_federated_emulation_per_batch as flb, centralized_learning as cl
 import pandas as pd
 import tensorflow as tf
-import os
 
-os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
 
-def federated_batch_training(path: str, size: int, num_clients:int, rounds:int, batch_size: int) -> pd.DataFrame:
+def federated_batch_training(path: str, size: int, num_clients: int, rounds: int, batch_size: int) -> pd.DataFrame:
   """
-    Uses the library simple_federated_emulation_per_batch to execute a train session using the given parameters.
+  Uses the library simple_federated_emulation_per_batch to execute a train session using the given parameters.
 
-    Args:
-        path (str): Path where the gradients will be stored
-        size (int): Number of images to create the dataset
-        num_clients (int): Number of clients for the emulation
-        batch_size (int): Size of each batch
-        rounds (int): Number of rounds to train.
+  Args:
+      path (str): Path where the gradients will be stored
+      size (int): Number of images to create the dataset
+      num_clients (int): Number of clients for the emulation
+      batch_size (int): Size of each batch
+      rounds (int): Number of rounds to train.
 
-    Returns:
-        pd.DataFrame: A DataFrame containing training metrics.
-  """
+  Returns:
+      pd.DataFrame: A DataFrame containing training metrics.
+"""
 
   train_datasets, test_dataset = flb.get_and_divide_dataset(num_clients, batch_size, size)
   optimizer = tf.keras.optimizers.Adam()
@@ -29,10 +26,17 @@ def federated_batch_training(path: str, size: int, num_clients:int, rounds:int, 
   central_unit.__init__(cl.cnn, optimizer, loss_fn, ["accuracy"])
   central_unit.compile()
 
-  clients =[flb.Client(cl.cnn, train_datasets[i], f"user00{i+1}", optimizer, loss_fn, ["accuracy"]) for i in range(num_clients)]
+  clients = [flb.Client(cl.cnn, train_datasets[i], f"user00{i + 1}", optimizer, loss_fn, ["accuracy"]) for i in
+             range(num_clients)]
 
-  experimental_unit = flb.ExperimentalUnit(num_clients)
-  metrics_df = experimental_unit.federated_training(central_unit, clients, test_dataset, path, epochs=rounds)
+  experimental_unit = flb.ExperimentalUnit(num_clients, test_dataset)
+  metrics_df = experimental_unit.federated_training(
+    central_unit,
+    clients,
+    rounds,
+    batch_size,
+    path
+  )
 
   return metrics_df
 
@@ -40,8 +44,8 @@ def federated_batch_training(path: str, size: int, num_clients:int, rounds:int, 
 NUM_IMAGES = 2000
 NUM_CLIENTS = 10
 NUM_ROUNDS = 30
-BATCH_SIZE = [i for i in range(1,33)]
-path = "../results/batch_size_comparison"
+BATCH_SIZE = [3, 6, 9 ,12, 15, 18, 21, 24, 27, 30]
+path = "./results/batch_size_comparison"
 
 for size in BATCH_SIZE:
   print(f"Initializing federated emulation with size: {size}\n")
