@@ -4,7 +4,6 @@
 /images/
 /results/
 test.py
-plotting.ipynb
 
 # === Python-Specific ===
 __pycache__/
