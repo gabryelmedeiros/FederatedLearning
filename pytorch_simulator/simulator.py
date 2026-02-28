@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """
 Federated Learning Simulator with Gradient Compression.
 
@@ -28,12 +29,26 @@ class FLServer:
       - Maintain and distribute the global model
       - Aggregate client gradient updates (FedAvg style)
       - Evaluate global model on test set
+
+    Supports two optimizer modes:
+      - "sgd": simple w = w - lr * grad  (standard for FedAvg)
+      - "adam": uses torch Adam optimizer (matches TF simulator for raw gradients)
     """
 
-    def __init__(self, model: nn.Module, lr: float = 0.01, device: str = "cpu"):
+    def __init__(self, model: nn.Module, lr: float = 0.01,
+                 optimizer_type: str = "sgd", device: str = "cpu"):
         self.global_model = model.to(device)
         self.lr = lr
         self.device = device
+        self.optimizer_type = optimizer_type
+
+        # Initialize optimizer for Adam mode
+        if optimizer_type == "adam":
+            self.optimizer = torch.optim.Adam(
+                self.global_model.parameters(), lr=lr
+            )
+        else:
+            self.optimizer = None
 
     def get_global_weights(self) -> Dict[str, torch.Tensor]:
         """Return a copy of global model parameters."""
@@ -44,12 +59,11 @@ class FLServer:
         """
         Aggregate client gradient updates into the global model.
 
-        Uses weighted averaging (FedAvg). If client_weights is None,
+        Uses weighted averaging. If client_weights is None,
         uses uniform weighting.
 
-        Handles both:
-          - state_dict keys (from fedavg mode)
-          - named_parameters keys (from raw gradient mode)
+        For "sgd" mode:  w = w - lr * avg_gradient
+        For "adam" mode:  feeds avg_gradient to Adam optimizer (matches TF code)
 
         Args:
             client_updates: List of dicts mapping param_name -> gradient tensor.
@@ -69,25 +83,34 @@ class FLServer:
         # Determine which keys the updates use
         update_keys = list(client_updates[0].keys())
 
-        # Apply updates via named_parameters (works for both key formats)
-        # For raw gradients: keys match named_parameters (e.g., "conv1.weight")
-        # For fedavg deltas: keys match state_dict (same names for trainable params)
+        # Compute weighted average of gradients
+        param_dict = dict(self.global_model.named_parameters())
+        avg_grads = {}
+
+        for key in update_keys:
+            if key not in param_dict:
+                continue
+            aggregated = torch.zeros_like(param_dict[key], dtype=torch.float32)
+            for i, update in enumerate(client_updates):
+                aggregated += client_weights[i] * update[key].float()
+            avg_grads[key] = aggregated
+
+        # Apply the aggregated gradients
         with torch.no_grad():
-            param_dict = dict(self.global_model.named_parameters())
-
-            for key in update_keys:
-                if key not in param_dict:
-                    # Skip non-trainable parameters (e.g., batch norm running stats)
-                    continue
-
-                aggregated_grad = torch.zeros_like(param_dict[key], dtype=torch.float32)
-                for i, update in enumerate(client_updates):
-                    aggregated_grad += client_weights[i] * update[key].float()
-
-                # Apply: w = w - lr * aggregated_gradient
-                param_dict[key].data = (
-                    param_dict[key].data.float() - self.lr * aggregated_grad
-                ).to(param_dict[key].dtype)
+            if self.optimizer_type == "adam" and self.optimizer is not None:
+                # Feed averaged gradients into Adam (matches TF behavior)
+                self.optimizer.zero_grad()
+                for name, param in self.global_model.named_parameters():
+                    if name in avg_grads:
+                        param.grad = avg_grads[name].to(param.dtype)
+                self.optimizer.step()
+            else:
+                # Simple SGD: w = w - lr * grad
+                for name, param in self.global_model.named_parameters():
+                    if name in avg_grads:
+                        param.data = (
+                            param.data.float() - self.lr * avg_grads[name]
+                        ).to(param.dtype)
 
     def evaluate(self, test_loader: DataLoader) -> Tuple[float, float]:
         """
@@ -124,7 +147,7 @@ class FLClient:
 
     Supports two gradient strategies:
       - "raw":    Compute gradient on one mini-batch, do NOT update local model.
-                  Sends true gradient to server. (Distributed SGD)
+                  Sends true gradient to server. (Distributed SGD / your TF code)
       - "fedavg": Train locally for E epochs, then send the pseudo-gradient
                   delta = w_global - w_local. (McMahan et al. 2017)
 
@@ -171,7 +194,7 @@ class FLClient:
         """
         Compute raw gradient on ONE mini-batch without updating local model.
 
-        This matches the TF simulator behavior:
+        TF simulator behavior:
           1. Load global weights
           2. Forward + backward on one batch
           3. Extract gradients (do NOT apply them)
@@ -460,8 +483,20 @@ def fl_train(
     compress_fn, bits_fn = get_compressor(compression_method, **compression_kwargs)
 
     # ---- Initialize server ----
+    # Raw gradient mode: use Adam
+    # FedAvg mode: use simple SGD with global_lr = 1.0
     model_fn = lambda: get_model(dataset_name)
-    server = FLServer(model=model_fn(), lr=global_lr, device=device)
+
+    if gradient_strategy == "raw":
+        server = FLServer(
+            model=model_fn(), lr=global_lr,
+            optimizer_type="adam", device=device
+        )
+    else:
+        server = FLServer(
+            model=model_fn(), lr=global_lr,
+            optimizer_type="sgd", device=device
+        )
 
     # ---- Initialize clients ----
     clients = []
