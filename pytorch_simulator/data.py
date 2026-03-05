@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """
 Data loading and partitioning utilities for FL experiments.
 

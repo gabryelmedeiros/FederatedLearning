@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """
 Federated Learning Simulator with Gradient Compression.
 
@@ -146,7 +145,6 @@ class FLClient:
                                    ) -> Tuple[List[torch.Tensor], int]:
         """
         Compute gradient on ONE batch. No local model update.
-        Mirrors TF GradientTape exactly.
         """
         self.model.train()
         self.model.zero_grad()
@@ -211,7 +209,7 @@ class ExperimentalUnit:
     """
     Orchestrates FL experiments.
 
-    "raw" mode per epoch (TF behavior):
+    "raw" mode per epoch:
       1. Distribute global weights to all clients
       2. For each batch (synchronized):
          a. Each client computes gradient on its batch

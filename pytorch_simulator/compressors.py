@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """
 Gradient/Weight Compression Methods for Federated Learning.
 
