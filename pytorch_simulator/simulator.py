@@ -373,7 +373,8 @@ def fl_train(
     num_rounds: int = 50,
     local_epochs: int = 1,
     local_lr: float = 0.01,
-    global_lr: float = 0.001,
+    global_lr_batch_wise: float = 0.001,
+    global_lr_fedavg: float = 1.0,
     batch_size: int = 32,
     gradient_strategy: str = "raw",
     dataset_name: str = "mnist",
@@ -415,10 +416,10 @@ def fl_train(
     model_fn = lambda: get_model(dataset_name)
 
     if gradient_strategy == "raw":
-        server = FLServer(model=model_fn(), lr=global_lr,
+        server = FLServer(model=model_fn(), lr=global_lr_batch_wise,
                           optimizer_type="adam", device=device)
     else:
-        server = FLServer(model=model_fn(), lr=global_lr,
+        server = FLServer(model=model_fn(), lr=global_lr_fedavg,
                           optimizer_type="sgd", device=device)
 
     clients = []
