@@ -389,6 +389,7 @@ def fl_train(
     eval_every: int = 1,
 ) -> Dict:
     torch.manual_seed(seed)
+    global_lr: float = 1.0
 
     if compression_kwargs is None:
         compression_kwargs = {}
@@ -416,10 +417,12 @@ def fl_train(
     model_fn = lambda: get_model(dataset_name)
 
     if gradient_strategy == "raw":
-        server = FLServer(model=model_fn(), lr=global_lr_batch_wise,
+        gloabl_lr = global_lr_batch_wise
+        server = FLServer(model=model_fn(), lr=global_lr,
                           optimizer_type="adam", device=device)
     else:
-        server = FLServer(model=model_fn(), lr=global_lr_fedavg,
+        gloabl_lr = global_lr_fedavg
+        server = FLServer(model=model_fn(), lr=global_lr,
                           optimizer_type="sgd", device=device)
 
     clients = []
