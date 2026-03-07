@@ -373,8 +373,7 @@ def fl_train(
     num_rounds: int = 50,
     local_epochs: int = 1,
     local_lr: float = 0.01,
-    global_lr_batch_wise: float = 0.001,
-    global_lr_fedavg: float = 1.0,
+    global_lr: float = 1.0,
     batch_size: int = 32,
     gradient_strategy: str = "raw",
     dataset_name: str = "mnist",
@@ -389,7 +388,6 @@ def fl_train(
     eval_every: int = 1,
 ) -> Dict:
     torch.manual_seed(seed)
-    global_lr: float
 
     if compression_kwargs is None:
         compression_kwargs = {}
@@ -417,11 +415,10 @@ def fl_train(
     model_fn = lambda: get_model(dataset_name)
 
     if gradient_strategy == "raw":
-        global_lr = global_lr_batch_wise
+        global_lr = 0.001
         server = FLServer(model=model_fn(), lr=global_lr,
                           optimizer_type="adam", device=device)
     else:
-        global_lr = global_lr_fedavg
         server = FLServer(model=model_fn(), lr=global_lr,
                           optimizer_type="sgd", device=device)
 
