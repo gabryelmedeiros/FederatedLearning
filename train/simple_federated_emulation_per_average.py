@@ -421,7 +421,8 @@ def get_and_divide_dataset(num_clients, batch_size, max_dataset_size, normalizat
 
 # Example Usage
 if __name__ == "__main__":
-    output_dir = "./results"
+    output_dir = "./outputs"
+    result_dir = "./results"
     os.makedirs(output_dir, exist_ok=True)  # Create the output directory if it doesn't exist
 
     gradients_path = os.path.join(output_dir, "federated_emulation_average")
@@ -444,7 +445,7 @@ if __name__ == "__main__":
     metrics_df = experimental_unit.federated_training(central_unit, clients, test_dataset, gradients_path, rounds)
 
     metrics_df['round'] = metrics_df.index + 1
-    output_csv_path = os.path.join(output_dir, f"federated_all_local_dataset_size_{size}.csv")
+    output_csv_path = os.path.join(result_dir, f"federated_all_local_dataset_size_{size}.csv")
     try:
         metrics_df.to_csv(output_csv_path, index=False)
         print(f"Metrics saved to {output_csv_path}")

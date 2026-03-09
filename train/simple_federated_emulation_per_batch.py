@@ -206,7 +206,7 @@ class Client:
         self.optimizer = optimizer
         self.loss = loss
         self.metrics = metrics
-        self.loss_fn = tf.keras.losses.SparseCategoricalCrossentropy()
+        #self.loss_fn = tf.keras.losses.SparseCategoricalCrossentropy()
 
     def get_id(self):
         """Returns the client's ID."""
@@ -229,7 +229,7 @@ class Client:
         """Computes the gradients of the local model's loss with respect to its weights for a batch."""
         with tf.GradientTape() as tape:
             logits = self.local_model(images, training=True)
-            loss_value = self.loss_fn(labels, logits)
+            loss_value = self.loss(labels, logits)
         gradients = tape.gradient(loss_value, self.local_model.trainable_weights)
         return gradients
 
