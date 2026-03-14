@@ -14,7 +14,7 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 from typing import List, Dict, Callable, Tuple, Optional
 
-from compressors import get_compressor
+from .compressors import get_compressor
 
 
 # =============================================================================
@@ -241,65 +241,60 @@ class ExperimentalUnit:
         else:
             raise ValueError(f"Unknown strategy: '{gradient_strategy}'")
 
-    def _run_raw(self, num_epochs: int, eval_every: int, verbose: bool) -> Dict:
+    def _run_raw(self, num_rounds: int, eval_every: int, verbose: bool) -> Dict:
         history = self._init_history()
         total_bits = 0
 
         # Initial eval
         init_loss, init_acc = self.server.evaluate(self.test_loader)
         if verbose:
-            print(f"[Epoch 0] Loss: {init_loss:.4f} | Accuracy: {init_acc:.4f}")
-        self._record(history, 0, init_loss, init_acc, 0, 0)
+            print(f"[Round 0] Loss: {init_loss:.4f} | Accuracy: {init_acc:.4f}")
+        self._record(history, 0, init_loss, init_acc, 0, 0, 0, 0)
 
-        for epoch in range(1, num_epochs + 1):
-            epoch_bits = 0
+        # Persistent iterators: one batch per client per round, cycling through dataset
+        client_iterators = [iter(c.local_data) for c in self.clients]
+        total_samples = 0
 
-            # 1. Distribute global weights to all clients
+        for round_num in range(1, num_rounds + 1):
+            # Distribute global weights
             global_weights = self.server.get_global_weights()
             for client in self.clients:
                 client.set_weights(global_weights)
 
-            # 2. Create synchronized batch iterators
-            client_iterators = [iter(c.local_data) for c in self.clients]
-            num_batches = min(len(c.local_data) for c in self.clients)
+            # Each client computes gradient on ONE batch
+            batch_gradients = []
+            round_bits = 0
+            round_samples = 0
 
-            # 3. Process each batch
-            for batch_idx in range(num_batches):
-                batch_gradients = []
+            for c_idx, client in enumerate(self.clients):
+                try:
+                    data, target = next(client_iterators[c_idx])
+                except StopIteration:
+                    client_iterators[c_idx] = iter(client.local_data)
+                    data, target = next(client_iterators[c_idx])
 
-                for c_idx, client in enumerate(self.clients):
-                    try:
-                        data, target = next(client_iterators[c_idx])
-                    except StopIteration:
-                        client_iterators[c_idx] = iter(client.local_data)
-                        data, target = next(client_iterators[c_idx])
+                grads, bits = client.compute_gradient_on_batch(data, target)
+                batch_gradients.append(grads)
+                round_bits += bits
+                round_samples += data.shape[0]
 
-                    grads, bits = client.compute_gradient_on_batch(data, target)
-                    batch_gradients.append(grads)
-                    epoch_bits += bits
-
-                # Server aggregates and applies (Adam)
-                self.server.aggregate_and_apply(batch_gradients)
-
-                # Distribute updated weights for next batch
-                global_weights = self.server.get_global_weights()
-                for client in self.clients:
-                    client.set_weights(global_weights)
-
-            total_bits += epoch_bits
+            # Server aggregates and applies (Adam)
+            self.server.aggregate_and_apply(batch_gradients)
+            total_bits += round_bits
+            total_samples += round_samples
 
             # Evaluate
-            if epoch % eval_every == 0 or epoch == num_epochs:
+            if round_num % eval_every == 0 or round_num == num_rounds:
                 test_loss, test_acc = self.server.evaluate(self.test_loader)
-                self._record(history, epoch, test_loss, test_acc,
-                             epoch_bits, total_bits)
+                self._record(history, round_num, test_loss, test_acc,
+                             round_bits, total_bits, round_samples, total_samples)
                 if verbose:
                     bits_mb = total_bits / (8 * 1024 * 1024)
                     print(
-                        f"[Epoch {epoch:3d}] "
+                        f"[Round {round_num:3d}] "
                         f"Loss: {test_loss:.4f} | "
                         f"Acc: {test_acc:.4f} | "
-                        f"Batches: {num_batches} | "
+                        f"Samples: {total_samples:,} | "
                         f"Total: {bits_mb:.2f} MB"
                     )
 
@@ -313,13 +308,17 @@ class ExperimentalUnit:
         init_loss, init_acc = self.server.evaluate(self.test_loader)
         if verbose:
             print(f"[Round 0] Loss: {init_loss:.4f} | Accuracy: {init_acc:.4f}")
-        self._record(history, 0, init_loss, init_acc, 0, 0)
+        self._record(history, 0, init_loss, init_acc, 0, 0, 0, 0)
+
+        total_samples = 0
 
         for round_num in range(1, num_rounds + 1):
             global_weights = self.server.get_global_weights()
             client_updates = []
             client_weights = []
             round_bits = 0
+            # Each client processes local_epochs full passes over its local dataset
+            round_samples = sum(c.num_samples for c in self.clients) * local_epochs
 
             for client in self.clients:
                 update, bits = client.compute_fedavg_update(
@@ -329,19 +328,20 @@ class ExperimentalUnit:
                 round_bits += bits
 
             total_bits += round_bits
+            total_samples += round_samples
             self.server.aggregate_dicts_and_apply(client_updates, client_weights)
 
             if round_num % eval_every == 0 or round_num == num_rounds:
                 test_loss, test_acc = self.server.evaluate(self.test_loader)
                 self._record(history, round_num, test_loss, test_acc,
-                             round_bits, total_bits)
+                             round_bits, total_bits, round_samples, total_samples)
                 if verbose:
                     bits_mb = total_bits / (8 * 1024 * 1024)
                     print(
                         f"[Round {round_num:3d}] "
                         f"Loss: {test_loss:.4f} | "
                         f"Acc: {test_acc:.4f} | "
-                        f"Round bits: {round_bits:,} | "
+                        f"Samples: {total_samples:,} | "
                         f"Total: {bits_mb:.2f} MB"
                     )
 
@@ -352,16 +352,20 @@ class ExperimentalUnit:
         return {
             "accuracy": [], "loss": [],
             "bits_per_round": [], "cumulative_bits": [],
+            "samples_per_round": [], "cumulative_samples": [],
             "rounds": [],
         }
 
     @staticmethod
-    def _record(history, round_num, loss, acc, round_bits, cum_bits):
+    def _record(history, round_num, loss, acc, round_bits, cum_bits,
+                round_samples, cum_samples):
         history["rounds"].append(round_num)
         history["accuracy"].append(acc)
         history["loss"].append(loss)
         history["bits_per_round"].append(round_bits)
         history["cumulative_bits"].append(cum_bits)
+        history["samples_per_round"].append(round_samples)
+        history["cumulative_samples"].append(cum_samples)
 
 
 # =============================================================================
@@ -392,11 +396,13 @@ def fl_train(
     if compression_kwargs is None:
         compression_kwargs = {}
 
-    from data import load_mnist, partition_data, get_client_loader, get_test_loader
-    from models import get_model
+    from .data import load_mnist, load_cifar10, partition_data, get_client_loader, get_test_loader
+    from .models import get_model
 
     if dataset_name == "mnist":
         train_dataset, test_dataset = load_mnist()
+    elif dataset_name == "cifar10":
+        train_dataset, test_dataset = load_cifar10()
     else:
         raise ValueError(f"Unsupported dataset: {dataset_name}")
 
@@ -415,7 +421,6 @@ def fl_train(
     model_fn = lambda: get_model(dataset_name)
 
     if gradient_strategy == "raw":
-        global_lr = 0.001
         server = FLServer(model=model_fn(), lr=global_lr,
                           optimizer_type="adam", device=device)
     else:
