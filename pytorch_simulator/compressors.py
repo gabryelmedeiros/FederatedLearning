@@ -49,7 +49,36 @@ def spt_count(x_hat: torch.Tensor, max_iter: int = 64) -> torch.Tensor:
     return torch.sum(count)
 
 
-def mpgbp(x: torch.Tensor, M_max: int, P: int, epsilon: float = 1e-6) -> torch.Tensor:
+def extract_exponents(x_hat: torch.Tensor, max_iter: int = 64) -> list:
+    """
+    Extract all power-of-two exponents from the SPT representation of x_hat.
+
+    Each nonzero element is decomposed into powers of two; the exponent
+    (floor of log2 of the absolute value) is recorded for each term.
+    The maximum absolute exponent determines the word length needed for
+    hardware implementation (see Fig. 6 in da Silva et al., 2014).
+
+    Args:
+        x_hat:    Approximated vector (1-D).
+        max_iter: Safety cap per element.
+
+    Returns:
+        List of integer exponents from all elements.
+    """
+    exponents = []
+    for idx in range(len(x_hat)):
+        residue = torch.abs(x_hat[idx])
+        iters = 0
+        while residue > 1e-12 and iters < max_iter:
+            exp = torch.floor(torch.log2(residue))
+            exponents.append(int(exp.item()))
+            residue = torch.abs(residue - 2 ** exp)
+            iters += 1
+    return exponents
+
+
+def mpgbp(x: torch.Tensor, M_max: int, P: int, epsilon: float = 1e-6,
+          return_metadata: bool = False):
     """
     MPGBP algorithm for vector quantization using signed powers of two.
 
@@ -58,13 +87,20 @@ def mpgbp(x: torch.Tensor, M_max: int, P: int, epsilon: float = 1e-6) -> torch.T
     where the scaling factor is quantized to the nearest power of two.
 
     Args:
-        x:     Input vector (any shape, will be flattened internally).
-        M_max: Maximum total number of SPTs allowed in the approximation.
-        P:     Number of nonzero entries per codeword.
-        epsilon: Early stopping threshold on residual norm.
+        x:               Input vector (any shape, will be flattened internally).
+        M_max:           Maximum total number of SPTs allowed in the approximation.
+        P:               Number of nonzero entries per codeword.
+        epsilon:         Early stopping threshold on residual norm.
+        return_metadata: If True, return (x_hat, metadata_dict) instead of x_hat.
 
     Returns:
-        Approximation x_hat, same shape and dtype as input.
+        x_hat (torch.Tensor) if return_metadata=False.
+        (x_hat, dict) if return_metadata=True, where dict contains:
+            "total_spts"      : int   — total SPTs in x_hat (from spt_count)
+            "max_exponent"    : int   — max |exponent| across all SPT terms
+            "num_iterations"  : int   — number of MPGBP iterations run
+            "exponents_used"  : list  — per-iteration exponent (k_m values)
+            "residual_norm"   : float — final ||residue||_2
     """
     orig_shape = x.shape
     dtype = x.dtype
@@ -74,6 +110,8 @@ def mpgbp(x: torch.Tensor, M_max: int, P: int, epsilon: float = 1e-6) -> torch.T
     x_hat = torch.zeros(N)
     residue = x_vec.clone()
     M = 0
+    iteration_exponents = []
+    num_iterations = 0
 
     while M < M_max:
         # Build sparse codeword from top-P residual positions
@@ -99,6 +137,10 @@ def mpgbp(x: torch.Tensor, M_max: int, P: int, epsilon: float = 1e-6) -> torch.T
         power = -torch.ceil(torch.log2(3.0 / (4.0 * alpha)))
         spt = 2.0 ** power
 
+        # Track iteration metadata
+        iteration_exponents.append(int(power.item()))
+        num_iterations += 1
+
         # Update approximation and residue
         residue = residue - spt * codeword
         x_hat = x_hat + spt * codeword
@@ -110,53 +152,168 @@ def mpgbp(x: torch.Tensor, M_max: int, P: int, epsilon: float = 1e-6) -> torch.T
         if torch.norm(residue, p=2) <= epsilon:
             break
 
-    return x_hat.reshape(orig_shape).to(dtype)
+    result = x_hat.reshape(orig_shape).to(dtype)
+
+    if return_metadata:
+        total_spts = int(spt_count(x_hat).item())
+        all_exponents = extract_exponents(x_hat)
+        max_exp = max(abs(e) for e in all_exponents) if all_exponents else 0
+        metadata = {
+            "total_spts":     total_spts,
+            "max_exponent":   max_exp,
+            "num_iterations": num_iterations,
+            "exponents_used": iteration_exponents,
+            "residual_norm":  torch.norm(residue, p=2).item(),
+        }
+        return result, metadata
+
+    return result
 
 
-def compress_mpgbp(tensor: torch.Tensor, M_max: int = 16,
-                   mode: str = "C", epsilon: float = 1e-6) -> torch.Tensor:
+def compress_mpgbp(tensor: torch.Tensor, M_max: int = None,
+                   multiplier: float = 1.0, mode: str = "R",
+                   epsilon: float = 1e-6,
+                   return_metadata: bool = False):
     """
     Apply MPGBP compression to a tensor (gradient or weight).
 
     Modes:
-        "V" - Vectorized: treat entire tensor as one vector (for gradients)
-        "C" - Per-channel/row: quantize each row independently
-        "R" - Per-element-group: (reserved for future use)
+        "S" - Per-scalar:  each element quantized independently (P=1, M_max=1)
+        "R" - Per-row:     each row (first dimension) quantized independently
+        "L" - Per-layer:   entire tensor flattened into one vector
+        "N" - Per-network: handled outside via apply_mpgbp(); not valid here
 
     Args:
-        tensor:  Input tensor to compress.
-        M_max:   Maximum SPTs per quantization unit.
-        mode:    Quantization granularity.
-        epsilon: Convergence threshold.
+        tensor:          Input tensor to compress.
+        M_max:           Maximum SPTs per quantization unit. If given, used directly
+                         (backwards compatible). If None, computed from multiplier.
+        multiplier:      Budget multiplier for automatic M_max scaling:
+                           R mode:  M_max_row   = ceil(multiplier * K / 2)
+                           L mode:  M_max_layer = ceil(multiplier * K * R / 4)
+                           S mode:  always M_max=1 regardless of multiplier
+        mode:            Quantization granularity ("S", "R", or "L").
+        epsilon:         Convergence threshold.
+        return_metadata: If True, also return aggregated metadata dict.
 
     Returns:
-        Compressed tensor, same shape.
+        compressed tensor if return_metadata=False.
+        (compressed tensor, metadata dict) if return_metadata=True.
+        Metadata keys: total_spts, max_exponent, num_iterations, residual_norm.
     """
-    if mode == "V":
-        # Flatten entire tensor, quantize as one vector
+    def _empty_meta():
+        return {"total_spts": 0, "max_exponent": 0,
+                "num_iterations": 0, "residual_norm": 0.0}
+
+    def _merge_meta(agg, meta):
+        agg["total_spts"]     += meta["total_spts"]
+        agg["max_exponent"]    = max(agg["max_exponent"], meta["max_exponent"])
+        agg["num_iterations"] += meta["num_iterations"]
+        agg["residual_norm"]  += meta["residual_norm"]
+
+    if mode == "S":
+        m = M_max if M_max is not None else 1
+        flat = tensor.detach().reshape(-1).float()
+        result = torch.zeros_like(flat)
+        agg = _empty_meta()
+        for i in range(flat.numel()):
+            if return_metadata:
+                val, meta = mpgbp(flat[i:i + 1], M_max=m, P=1,
+                                  epsilon=epsilon, return_metadata=True)
+                result[i] = val[0]
+                _merge_meta(agg, meta)
+            else:
+                result[i] = mpgbp(flat[i:i + 1], M_max=m, P=1,
+                                  epsilon=epsilon)[0]
+        out = result.reshape(tensor.shape).to(tensor.dtype)
+        return (out, agg) if return_metadata else out
+
+    elif mode == "R":
+        result = torch.zeros_like(tensor)
+        agg = _empty_meta()
+        if tensor.dim() == 1:
+            K = tensor.numel()
+            P = max(1, math.ceil(math.sqrt(K)))
+            m = M_max if M_max is not None else max(1, math.ceil(multiplier * K / 2))
+            if return_metadata:
+                result, meta = mpgbp(tensor, M_max=m, P=P,
+                                     epsilon=epsilon, return_metadata=True)
+                _merge_meta(agg, meta)
+            else:
+                result = mpgbp(tensor, M_max=m, P=P, epsilon=epsilon)
+        else:
+            for i in range(tensor.shape[0]):
+                row = tensor[i]
+                K = row.numel()
+                P = max(1, math.ceil(math.sqrt(K)))
+                m = M_max if M_max is not None else max(1, math.ceil(multiplier * K / 2))
+                if return_metadata:
+                    result[i], meta = mpgbp(row, M_max=m, P=P,
+                                            epsilon=epsilon, return_metadata=True)
+                    _merge_meta(agg, meta)
+                else:
+                    result[i] = mpgbp(row, M_max=m, P=P, epsilon=epsilon)
+        return (result, agg) if return_metadata else result
+
+    elif mode == "L":
         flat = tensor.detach().reshape(-1)
         N = flat.numel()
         P = max(1, math.ceil(math.sqrt(N)))
-        return mpgbp(flat, M_max=M_max, P=P, epsilon=epsilon).reshape(tensor.shape)
-
-    elif mode == "C":
-        # Quantize each row (channel/neuron) independently
-        result = torch.zeros_like(tensor)
-        if tensor.dim() == 1:
-            N = tensor.numel()
-            P = max(1, math.ceil(math.sqrt(N)))
-            result = mpgbp(tensor, M_max=M_max, P=P, epsilon=epsilon)
+        if M_max is not None:
+            m = M_max
         else:
-            # Iterate over first dimension
-            for i in range(tensor.shape[0]):
-                row = tensor[i]
-                N = row.numel()
-                P = max(1, math.ceil(math.sqrt(N)))
-                result[i] = mpgbp(row, M_max=M_max, P=P, epsilon=epsilon)
-        return result
+            if tensor.dim() == 1:
+                K, R = N, 1
+            else:
+                K = tensor[0].numel()
+                R = tensor.shape[0]
+            m = max(1, math.ceil(multiplier * K * R / 4))
+        if return_metadata:
+            compressed, meta = mpgbp(flat, M_max=m, P=P,
+                                     epsilon=epsilon, return_metadata=True)
+            out = compressed.reshape(tensor.shape)
+            return out, meta
+        return mpgbp(flat, M_max=m, P=P, epsilon=epsilon).reshape(tensor.shape)
 
     else:
-        raise ValueError(f"Unknown MPGBP mode: {mode}. Use 'V' or 'C'.")
+        raise ValueError(f"Unknown MPGBP mode: '{mode}'. Use 'S', 'R', 'L', or 'N' (N via apply_mpgbp).")
+
+
+def apply_mpgbp(params: list, M_max: int = None,
+                multiplier: float = 1.0, epsilon: float = 1e-6) -> list:
+    """
+    Per-network MPGBP ("N" mode): concatenate all parameter tensors into one
+    vector, run mpgbp() once, then slice results back into original shapes.
+
+    Args:
+        params:     List of (tensor, shape) tuples — e.g. [(p.data.cpu(), p.shape) ...]
+        M_max:      Maximum total SPTs for the entire network. If given, used
+                    directly (backwards compatible). If None, computed from multiplier.
+        multiplier: Budget multiplier. M_max = ceil(multiplier * N / (2 * L))
+                    where N = total parameters, L = number of parameter tensors.
+                    NOTE: formula approximate — flag for advisor review.
+        epsilon:    Convergence threshold.
+
+    Returns:
+        List of compressed tensors, same shapes as input.
+    """
+    shapes = [t.shape for t, _ in params]
+    flat   = torch.cat([t.detach().reshape(-1).float() for t, _ in params])
+    N      = flat.numel()
+    P      = max(1, math.ceil(math.sqrt(N)))
+    if M_max is not None:
+        m = M_max
+    else:
+        L = len(params)
+        # NOTE: conservative budget formula — validate with advisor.
+        m = max(1, math.ceil(multiplier * N / (2 * L)))
+    compressed = mpgbp(flat, M_max=m, P=P, epsilon=epsilon)
+    results = []
+    offset  = 0
+    for (orig, _), shape in zip(params, shapes):
+        numel = orig.numel()
+        results.append(compressed[offset:offset + numel].reshape(shape).to(orig.dtype))
+        offset += numel
+    return results
 
 
 # =============================================================================
@@ -274,27 +431,28 @@ def estimate_bits(tensor: torch.Tensor, method: str, **kwargs) -> int:
         return numel * n_bits + 32
 
     elif method == "mpgbp":
-        # For MPGBP: each SPT needs log2(N) bits for position + 1 bit for sign
-        # + exponent bits for the power of two.
         # Simplified estimate: M_max * (ceil(log2(N)) + 1 + 8) per quantization unit
+        # where N = size of the vector being quantized.
         M_max = kwargs.get("M_max", 16)
-        mode = kwargs.get("mode", "V")
-        if mode == "V":
-            N = numel
-            bits_per_spt = math.ceil(math.log2(max(N, 2))) + 1 + 8
-            return M_max * bits_per_spt
-        elif mode == "C":
+        mode  = kwargs.get("mode", "R")
+        if mode == "S":
+            # Each scalar is quantized independently: N=1, log2(1)=0
+            # bits per element = M_max * (0 + 1 + 8) = M_max * 9
+            return numel * M_max * 9
+        elif mode == "R":
             total = 0
             if tensor.dim() == 1:
                 N = numel
-                bits_per_spt = math.ceil(math.log2(max(N, 2))) + 1 + 8
-                total = M_max * bits_per_spt
+                total = M_max * (math.ceil(math.log2(max(N, 2))) + 1 + 8)
             else:
                 for i in range(tensor.shape[0]):
                     N = tensor[i].numel()
-                    bits_per_spt = math.ceil(math.log2(max(N, 2))) + 1 + 8
-                    total += M_max * bits_per_spt
+                    total += M_max * (math.ceil(math.log2(max(N, 2))) + 1 + 8)
             return total
+        elif mode in ("L", "N"):
+            # One vector: entire tensor (L) or entire network (N, caller handles N)
+            N = numel
+            return M_max * (math.ceil(math.log2(max(N, 2))) + 1 + 8)
         else:
             return numel * 32  # fallback
 
@@ -328,13 +486,30 @@ def get_compressor(method: str, **kwargs):
         )
 
     elif method == "mpgbp":
-        M_max = kwargs.get("M_max", 16)
-        mode = kwargs.get("mode", "V")
-        epsilon = kwargs.get("epsilon", 1e-6)
+        M_max      = kwargs.get("M_max", None)
+        multiplier = kwargs.get("multiplier", 1.0)
+        mode       = kwargs.get("mode", "R")
+        epsilon    = kwargs.get("epsilon", 1e-6)
         return (
-            lambda t: compress_mpgbp(t, M_max=M_max, mode=mode, epsilon=epsilon),
+            lambda t: compress_mpgbp(t, M_max=M_max, multiplier=multiplier,
+                                     mode=mode, epsilon=epsilon),
             lambda t: estimate_bits(t, "mpgbp", M_max=M_max, mode=mode),
         )
 
     else:
         raise ValueError(f"Unknown compression method: {method}")
+
+
+# =============================================================================
+# Quick self-test
+# =============================================================================
+
+if __name__ == "__main__":
+    torch.manual_seed(42)
+    test_tensor = torch.randn(4, 3)
+    print(f"Original:\n{test_tensor}\n")
+
+    for mode in ["S", "R", "L"]:
+        result = compress_mpgbp(test_tensor, M_max=16, mode=mode)
+        mse = torch.mean((test_tensor - result) ** 2).item()
+        print(f"Mode {mode}: MSE = {mse:.6f}, shape = {result.shape}")

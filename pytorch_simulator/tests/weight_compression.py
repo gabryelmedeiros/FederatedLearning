@@ -33,7 +33,8 @@ import pandas as pd
 
 from pytorch_simulator.models import get_model, count_parameters
 from pytorch_simulator.data import load_mnist, get_test_loader
-from pytorch_simulator.compressors import mpgbp, compress_mpgbp, apply_mpgbp
+from pytorch_simulator.compressors import (mpgbp, compress_mpgbp, apply_mpgbp,
+                                           spt_count, extract_exponents)
 
 
 # ── Config ─────────────────────────────────────────────────────────────────────
@@ -42,9 +43,13 @@ TRAIN_EPOCHS = 10
 BATCH_SIZE   = 64
 LR           = 0.001
 VAL_SPLIT    = 10_000
-M_MAX_VALUES = [4, 8, 16, 32, 48, 64, 96, 128, 192, 256, 384, 512]
-M_MAX_S      = [1, 2, 3, 4]   # S mode saturates quickly; no need for large values
-MODES        = ["S", "R", "L", "N"]
+# M_max scaling: pass a multiplier; actual M_max computed per-tensor inside compress_mpgbp.
+# S mode always uses M_max=1 (fixed). R, L, N use multiplier-based scaling.
+MULTIPLIERS_R = [0.5, 1, 1.5, 2]
+MULTIPLIERS_L = [0.5, 0.75, 1, 1.25]
+MULTIPLIERS_N = [0.5, 0.6, 0.7, 0.8, 0.9, 1, 1.1, 1.2]
+# MODES         = ["S", "R", "L", "N"]
+MODES = ["N"]
 SEED         = 42
 
 RESULTS_DIR = os.path.join(os.path.dirname(__file__), "..", "results")
@@ -91,29 +96,116 @@ def evaluate(model, loader, device):
 
 
 # ── Compression ────────────────────────────────────────────────────────────────
-def compress_model(original_model, M_max, mode):
-    """Return a new model with MPGBP-compressed weights. Never mutates original."""
-    model = copy.deepcopy(original_model)
+def _mmax_info(model, multiplier, mode):
+    """Return a string describing the M_max values that will be used."""
+    lines = []
+    for name, param in model.named_parameters():
+        t = param.data
+        if mode == "S":
+            lines.append(f"  {name}: M_max=1 (fixed)")
+        elif mode == "R":
+            K = t[0].numel() if t.dim() >= 2 else t.numel()
+            m = max(1, math.ceil(multiplier * K / 2))
+            lines.append(f"  {name}: K={K}, M_max={m}")
+        elif mode == "L":
+            if t.dim() == 1:
+                K, R = t.numel(), 1
+            else:
+                K = t[0].numel()
+                R = t.shape[0]
+            m = max(1, math.ceil(multiplier * K * R / 4))
+            lines.append(f"  {name}: K={K}, R={R}, M_max={m}")
+        elif mode == "N":
+            pass  # single M_max for whole network, handled separately
+    return "\n".join(lines)
 
-    if mode in ("S", "R", "L"):
+
+def compute_mmax_range(model, multiplier, mode):
+    """Return (m_max_min, m_max_max) for the given mode and multiplier."""
+    if mode == "S" or multiplier is None:
+        return 1, 1
+    elif mode == "R":
+        values = []
+        for param in model.parameters():
+            t = param.data
+            K = t[0].numel() if t.dim() >= 2 else t.numel()
+            values.append(max(1, math.ceil(multiplier * K / 2)))
+        return min(values), max(values)
+    elif mode == "L":
+        values = []
+        for param in model.parameters():
+            t = param.data
+            if t.dim() == 1:
+                K, R = t.numel(), 1
+            else:
+                K = t[0].numel()
+                R = t.shape[0]
+            values.append(max(1, math.ceil(multiplier * K * R / 4)))
+        return min(values), max(values)
+    elif mode == "N":
+        param_list = list(model.parameters())
+        N = sum(p.numel() for p in param_list)
+        L = len(param_list)
+        m = max(1, math.ceil(multiplier * N / (2 * L)))
+        return m, m
+    return None, None
+
+
+def compress_model(original_model, multiplier, mode):
+    """
+    Return (new_model, metadata) where new_model has MPGBP-compressed weights.
+    original_model is never mutated.
+    Metadata aggregates total_spts, max_exponent, num_iterations, residual_norm
+    across all parameter tensors.
+    """
+    model = copy.deepcopy(original_model)
+    total_meta = {"total_spts": 0, "max_exponent": 0,
+                  "num_iterations": 0, "residual_norm": 0.0}
+
+    def _merge(dst, src):
+        dst["total_spts"]     += src["total_spts"]
+        dst["max_exponent"]    = max(dst["max_exponent"], src["max_exponent"])
+        dst["num_iterations"] += src["num_iterations"]
+        dst["residual_norm"]  += src["residual_norm"]
+
+    if mode == "S":
         with torch.no_grad():
             for param in model.parameters():
-                param.data = compress_mpgbp(
-                    param.data.cpu(), M_max=M_max, mode=mode
-                ).to(param.dtype).to(param.device)
+                compressed, meta = compress_mpgbp(
+                    param.data.cpu(), M_max=1, mode="S", return_metadata=True
+                )
+                param.data = compressed.to(param.dtype).to(param.device)
+                _merge(total_meta, meta)
+
+    elif mode in ("R", "L"):
+        with torch.no_grad():
+            for param in model.parameters():
+                compressed, meta = compress_mpgbp(
+                    param.data.cpu(), multiplier=multiplier, mode=mode,
+                    return_metadata=True
+                )
+                param.data = compressed.to(param.dtype).to(param.device)
+                _merge(total_meta, meta)
 
     elif mode == "N":
         param_list = list(model.parameters())
         N = sum(p.numel() for p in param_list)
-        P = max(1, math.ceil(math.sqrt(N)))
-        print(f"    N mode: N={N:,}, P={P:,}  (this may take a while…)")
+        L = len(param_list)
+        m = max(1, math.ceil(multiplier * N / (2 * L)))
+        print(f"    N mode: total_params={N:,}, L={L}, M_max={m}")
         params_in = [(p.data.cpu(), p.shape) for p in param_list]
-        compressed = apply_mpgbp(params_in, M_max=M_max)
+        compressed = apply_mpgbp(params_in, multiplier=multiplier)
         with torch.no_grad():
             for param, comp in zip(param_list, compressed):
                 param.data = comp.to(param.dtype).to(param.device)
+        # N mode: estimate metadata from compressed model parameters
+        all_params_flat = torch.cat([p.data.cpu().reshape(-1).float()
+                                     for p in model.parameters()])
+        total_meta["total_spts"] = int(spt_count(all_params_flat).item())
+        all_exp = extract_exponents(all_params_flat)
+        total_meta["max_exponent"] = max(abs(e) for e in all_exp) if all_exp else 0
 
-    return model
+    return model, total_meta
 
 
 # ── 1. Train ───────────────────────────────────────────────────────────────────
@@ -157,31 +249,52 @@ print(f"Parameters             : {count_parameters(model):,}")
 print(f"{'─'*60}\n")
 
 # ── 3. Compression sweep ───────────────────────────────────────────────────────
+mode_multipliers = {
+    "S": [None],           # always M_max=1
+    "R": MULTIPLIERS_R,
+    "L": MULTIPLIERS_L,
+    "N": MULTIPLIERS_N,
+}
+
 rows = []
 
 for mode in MODES:
-    m_max_list = M_MAX_S if mode == "S" else M_MAX_VALUES
-    for M_max in m_max_list:
-        print(f"[Mode={mode}, M_max={M_max}]")
+    for multiplier in mode_multipliers[mode]:
+        label = "M_max=1 (fixed)" if mode == "S" else f"multiplier={multiplier}"
+        print(f"[Mode={mode}, {label}]")
+
+        if mode not in ("S", "N"):
+            print(_mmax_info(model, multiplier, mode))
+
+        m_max_min, m_max_max = compute_mmax_range(model, multiplier, mode)
+
         t0 = time.time()
+        compressed_model, meta = compress_model(model, multiplier, mode)
+        elapsed                = time.time() - t0
+        _, acc                 = evaluate(compressed_model, test_loader, DEVICE)
 
-        compressed_model = compress_model(model, M_max, mode)
-        elapsed          = time.time() - t0
-        _, acc           = evaluate(compressed_model, test_loader, DEVICE)
-
-        print(f"  Test acc : {acc:.4f}  (drop: {baseline_acc - acc:+.4f})  [{elapsed:.1f}s]\n")
+        print(f"  Test acc     : {acc:.4f}  (drop: {baseline_acc - acc:+.4f})")
+        print(f"  Total SPTs   : {meta['total_spts']:,}")
+        print(f"  Max exponent : {meta['max_exponent']}")
+        print(f"  Iterations   : {meta['num_iterations']:,}")
+        print(f"  Time         : {elapsed:.1f}s\n")
 
         rows.append({
-            "mode":          mode,
-            "M_max":         M_max,
-            "test_accuracy": round(acc, 6),
-            "accuracy_drop": round(baseline_acc - acc, 6),
-            "time_s":        round(elapsed, 2),
+            "mode":           mode,
+            "multiplier":     multiplier if multiplier is not None else "fixed",
+            "m_max_min":      m_max_min,
+            "m_max_max":      m_max_max,
+            "test_accuracy":  round(acc, 6),
+            "accuracy_drop":  round(baseline_acc - acc, 6),
+            "total_spts":     meta["total_spts"],
+            "max_exponent":   meta["max_exponent"],
+            "num_iterations": meta["num_iterations"],
+            "time_s":         round(elapsed, 2),
         })
 
 # ── 4. Save & print ────────────────────────────────────────────────────────────
 df = pd.DataFrame(rows)
-csv_path = os.path.join(RESULTS_DIR, f"weight_compression_{RUN_TS}.csv")
+csv_path = os.path.join(RESULTS_DIR, f"weight_compression_net_only_{RUN_TS}.csv") #change here as well after testing only the new.
 df.to_csv(csv_path, index=False)
 
 print("=" * 60)
